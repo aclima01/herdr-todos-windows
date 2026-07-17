@@ -2,13 +2,15 @@
 # so a dev can follow the model's plan as it works. Windows / PowerShell, no dependencies.
 #
 # It resolves the agent sharing this pane's tab, finds that session's transcript
-# (~/.claude/projects/**/<session-id>.jsonl), replays TaskCreate (ids 1..N in order) + TaskUpdate
-# (taskId -> status) into the current list, and redraws when the transcript changes. Poll-based, so
-# it catches mid-turn task edits. Press q to quit.
+# (~/.claude/projects/**/<session-id>.jsonl), and replays TaskCreate (ids 1..N in order) +
+# TaskUpdate (taskId -> status). Reads are incremental: a byte high-watermark means each poll only
+# parses the newly-appended lines, not the whole file.
 #
-# Theming: reads $HERDR_PLUGIN_CONFIG_DIR/config.toml (a flat key = value file). `theme` picks a
-# preset; individual colors (`bg`, `fg`, `done`, `active`, `pending`, `accent`, hex "#rrggbb")
-# override it. A `bg` paints the whole pane. Size/placement live in panel.ps1 (the opener).
+# Keys: q close; s send a note to the agent; j/k or arrows and PageUp/PageDown scroll; g re-follows
+# the active task.
+#
+# Theming: $HERDR_PLUGIN_CONFIG_DIR/config.toml (flat key = value). `theme` picks a preset; per-
+# color hex overrides win. A `bg` paints the whole pane. Size/placement live in panel.ps1.
 #
 # Source is pure ASCII on purpose: PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so glyphs are
 # built from [char] codes rather than written as literals.
@@ -21,7 +23,7 @@ $esc = [char]27
 
 # Glyphs (from code points so the source stays ASCII).
 $G_CHECK = [char]0x2713; $G_PLAY = [char]0x25B6; $G_CIRC = [char]0x25CB; $G_CROSS = [char]0x2717
-$MIDDOT = [char]0x00B7; $HR = [string][char]0x2500
+$MIDDOT = [char]0x00B7; $HR = [string][char]0x2500; $G_UP = [char]0x2191; $G_DOWN = [char]0x2193
 
 # ---- config + theme ----
 $THEMES = @{
@@ -53,9 +55,7 @@ function Read-Config {
 function Resolve-Palette($cfg) {
     $name = if ($cfg.theme) { $cfg.theme } else { 'default' }
     $p = if ($THEMES.ContainsKey($name)) { $THEMES[$name].Clone() } else { $THEMES['default'].Clone() }
-    foreach ($k in 'bg', 'fg', 'title', 'done', 'active', 'pending', 'rule') {
-        if ($cfg[$k]) { $p[$k] = $cfg[$k] }
-    }
+    foreach ($k in 'bg', 'fg', 'title', 'done', 'active', 'pending', 'rule') { if ($cfg[$k]) { $p[$k] = $cfg[$k] } }
     $p
 }
 
@@ -87,43 +87,76 @@ function Find-Transcript([string]$sessionId) {
     if ($f) { $f.FullName } else { $null }
 }
 
-function Read-Tasks([string]$path) {
-    $tasks = New-Object System.Collections.Generic.List[object]
-    $byId = @{}
-    foreach ($line in [System.IO.File]::ReadLines($path)) {
-        if ($line.IndexOf('TaskCreate') -lt 0 -and $line.IndexOf('TaskUpdate') -lt 0) { continue }
-        $obj = $null; try { $obj = $line | ConvertFrom-Json } catch { continue }
-        $content = $obj.message.content
-        if ($content -isnot [System.Array]) { continue }
-        foreach ($b in $content) {
-            if ($b.type -ne 'tool_use') { continue }
-            if ($b.name -eq 'TaskCreate') {
-                $id = [string]($tasks.Count + 1)
-                $t = [pscustomobject]@{ id = $id; subject = [string]$b.input.subject; activeForm = [string]$b.input.activeForm; status = 'pending' }
-                $tasks.Add($t); $byId[$id] = $t
-            }
-            elseif ($b.name -eq 'TaskUpdate') {
-                $id = [string]$b.input.taskId
-                if ($byId.ContainsKey($id) -and $b.input.status) { $byId[$id].status = [string]$b.input.status }
-            }
+# ---- incremental task reader (byte high-watermark) ----
+$script:T_tasks = New-Object System.Collections.Generic.List[object]
+$script:T_byId = @{}
+$script:T_offset = [long]0
+$script:T_path = ''
+
+function Reset-Tasks {
+    $script:T_tasks = New-Object System.Collections.Generic.List[object]
+    $script:T_byId = @{}
+    $script:T_offset = [long]0
+}
+
+function Apply-Line([string]$line) {
+    if ($line.IndexOf('TaskCreate') -lt 0 -and $line.IndexOf('TaskUpdate') -lt 0) { return }
+    $obj = $null; try { $obj = $line | ConvertFrom-Json } catch { return }
+    $content = $obj.message.content
+    if ($content -isnot [System.Array]) { return }
+    foreach ($b in $content) {
+        if ($b.type -ne 'tool_use') { continue }
+        if ($b.name -eq 'TaskCreate') {
+            $id = [string]($script:T_tasks.Count + 1)
+            $t = [pscustomobject]@{ id = $id; subject = [string]$b.input.subject; activeForm = [string]$b.input.activeForm; status = 'pending' }
+            $script:T_tasks.Add($t); $script:T_byId[$id] = $t
+        }
+        elseif ($b.name -eq 'TaskUpdate') {
+            $id = [string]$b.input.taskId
+            if ($script:T_byId.ContainsKey($id) -and $b.input.status) { $script:T_byId[$id].status = [string]$b.input.status }
         }
     }
-    $tasks
+}
+
+# Parse only the bytes appended since the last call. Returns $true when new complete lines applied.
+# A new transcript path, or a shrunken file (rotation), resets the accumulated state.
+function Update-Tasks([string]$path) {
+    if ($path -ne $script:T_path) { $script:T_path = $path; Reset-Tasks }
+    $changed = $false
+    $fs = $null
+    try { $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite) } catch { return $false }
+    try {
+        $len = $fs.Length
+        if ($len -lt $script:T_offset) { Reset-Tasks }         # truncated / rotated
+        $count = $len - $script:T_offset
+        if ($count -le 0) { return $false }
+        if ($count -gt 20000000) { $count = 20000000 }         # cap a single read; the rest follows next poll
+        [void]$fs.Seek($script:T_offset, [System.IO.SeekOrigin]::Begin)
+        $buf = New-Object byte[] ([int]$count)
+        $read = $fs.Read($buf, 0, [int]$count)
+        $lastNL = -1
+        for ($i = $read - 1; $i -ge 0; $i--) { if ($buf[$i] -eq 10) { $lastNL = $i; break } }
+        if ($lastNL -lt 0) { return $false }                   # only a partial line so far; wait
+        $text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $lastNL + 1)
+        $script:T_offset += ($lastNL + 1)
+        foreach ($line in ($text -split "`n")) { if ($line) { Apply-Line $line; $changed = $true } }
+    }
+    finally { $fs.Close() }
+    $changed
 }
 
 # ---- render ----
-# Each row is @{ plain = '<text no ANSI>'; styled = '<text with color>' } so padding uses plain len.
-# $inputBuf: when not $null, the footer is a note-entry line. $status: a transient message.
-function Render($tasks, $agent, $ws, $pal, $inputBuf, $status) {
-    $bg = Bg $pal.bg
-    $fg = Fg $pal.fg
-    # "reset" keeps the theme background: a bare \e[0m would clear the bg, leaving black gaps after
-    # every colored span. Re-applying $bg after the reset keeps the whole line on the theme color.
-    $reset = "$esc[0m$bg"
+function Get-VisRows { [Math]::Max(1, [Console]::WindowHeight - 7) }  # rows reserved for chrome
+
+# Rows are @{ plain; styled } so padding uses the visible (plain) length.
+function Render($tasks, $agent, $ws, $pal, $inputBuf, $status, $scroll) {
+    $bg = Bg $pal.bg; $fg = Fg $pal.fg
+    $reset = "$esc[0m$bg"                 # keep the theme bg after every reset (no black gaps)
     $dim = "$esc[2m"
     try { $W = [Console]::WindowWidth } catch { $W = 44 }
     try { $H = [Console]::WindowHeight } catch { $H = 24 }
     if ($W -lt 10) { $W = 44 }; if ($H -lt 4) { $H = 24 }
+    $visRows = Get-VisRows
 
     $rows = New-Object System.Collections.Generic.List[object]
     $done = @($tasks | Where-Object { $_.status -eq 'completed' }).Count
@@ -131,11 +164,15 @@ function Render($tasks, $agent, $ws, $pal, $inputBuf, $status) {
     $who = @($agent, $ws | Where-Object { $_ }) -join " $MIDDOT "
     $rows.Add(@{ plain = " TO-DOs $who"; styled = " $(Fg $pal.title)$esc[1mTO-DOs$reset$fg $dim$who$reset$fg" })
     $rows.Add(@{ plain = ' ' + ($HR * ($W - 2)); styled = " $(Fg $pal.rule)$($HR * ($W - 2))$reset$fg" })
+
     if ($total -eq 0) {
         $rows.Add(@{ plain = '  (no tasks yet - the agent has not planned this turn)'; styled = "  $dim(no tasks yet - the agent has not planned this turn)$reset$fg" })
     }
     else {
-        foreach ($t in $tasks) {
+        $from = $scroll
+        $to = [Math]::Min($scroll + $visRows, $total)
+        for ($i = $from; $i -lt $to; $i++) {
+            $t = $tasks[$i]
             switch ($t.status) {
                 'completed'   { $g = "$(Fg $pal.done)$G_CHECK$reset$fg"; $label = $t.subject; $s = "$dim$label$reset$fg" }
                 'in_progress' { $g = "$(Fg $pal.active)$G_PLAY$reset$fg"; $label = if ($t.activeForm) { $t.activeForm } else { $t.subject }; $s = "$(Fg $pal.active)$esc[1m$label$reset$fg" }
@@ -146,8 +183,16 @@ function Render($tasks, $agent, $ws, $pal, $inputBuf, $status) {
             $rows.Add(@{ plain = "  X $num $label"; styled = "  $g $dim$num$reset$fg $s" })
         }
         $rows.Add(@{ plain = ''; styled = '' })
-        $rows.Add(@{ plain = "  $done/$total done"; styled = "  $dim$done/$total done$reset$fg" })
+        $pos = ''; $posP = ''
+        if ($total -gt $visRows) {
+            $up = if ($scroll -gt 0) { $G_UP } else { ' ' }
+            $dn = if ($to -lt $total) { $G_DOWN } else { ' ' }
+            $posP = "   $up$dn $($from + 1)-$to/$total"
+            $pos = "   $(Fg $pal.pending)$up$dn$reset$fg $dim$($from + 1)-$to/$total$reset$fg"
+        }
+        $rows.Add(@{ plain = "  $done/$total done$posP"; styled = "  $dim$done/$total done$reset$fg$pos" })
     }
+
     $rows.Add(@{ plain = ''; styled = '' })
     if ($null -ne $inputBuf) {
         $cur = [char]0x2588
@@ -156,37 +201,43 @@ function Render($tasks, $agent, $ws, $pal, $inputBuf, $status) {
     }
     elseif ($status) {
         $rows.Add(@{ plain = "  $status"; styled = "  $(Fg $pal.title)$status$reset$fg" })
-        $rows.Add(@{ plain = '  q close   s note to agent'; styled = "  $dim q close   s note to agent$reset$fg" })
     }
     else {
-        $rows.Add(@{ plain = '  q close   s note to agent'; styled = "  $dim q close   s note to agent$reset$fg" })
+        $rows.Add(@{ plain = '  q close  s note  j/k scroll'; styled = "  $dim q close  s note  j/k scroll$reset$fg" })
     }
 
     $out = [System.Text.StringBuilder]::new()
-    [void]$out.Append("$bg$esc[2J$esc[H") # set bg, clear to it, home
+    [void]$out.Append("$bg$esc[2J$esc[H")
     $n = $rows.Count
     for ($i = 0; $i -lt $n; $i++) {
         $plain = [string]$rows[$i].plain
         $styled = [string]$rows[$i].styled
         $pad = $W - $plain.Length; if ($pad -lt 0) { $pad = 0 }
         [void]$out.Append("$bg$fg$styled" + (' ' * $pad) + $reset)
-        if ($i -lt $n - 1) { [void]$out.Append("`n") }  # no trailing newline: never scroll
+        if ($i -lt $n - 1) { [void]$out.Append("`n") }
     }
-    [void]$out.Append("$bg$esc[0J$reset")  # paint the rest of the pane with the theme bg
+    [void]$out.Append("$bg$esc[0J$reset")
     [Console]::Write($out.ToString())
 }
 
-# ---- main loop (skipped when dot-sourced for tests) ----
-if ($MyInvocation.InvocationName -eq '.') { return }
-$pal = Resolve-Palette (Read-Config)
-$ws = $env:HERDR_WORKSPACE_ID
+# ---- helpers ----
+function Active-Index($tasks) {
+    for ($i = 0; $i -lt $tasks.Count; $i++) { if ($tasks[$i].status -eq 'in_progress') { return $i } }
+    -1
+}
+function Clamp-Scroll([int]$scroll, [int]$total) {
+    $max = [Math]::Max(0, $total - (Get-VisRows))
+    if ($scroll -gt $max) { $scroll = $max }
+    if ($scroll -lt 0) { $scroll = 0 }
+    $scroll
+}
 
-# Note-entry mode (v2 "steer"): type a note and send it to the agent's input via `herdr agent
-# send` (fills without submitting, then focuses the agent, like reviewr's Send). Returns a status.
-function Send-Note($agentPane, $agent, $tasks) {
+# Note-entry (v2 "steer"): type a note, Enter sends it to the agent input via `herdr agent send`
+# (fills without submitting) then focuses the agent, like reviewr's Send. Returns a status string.
+function Send-Note($agentPane, $agent, $tasks, $scroll) {
     $buf = ''
     while ($true) {
-        Render $tasks $agent $ws $pal $buf ''
+        Render $tasks $agent $ws $pal $buf '' $scroll
         $ik = [Console]::ReadKey($true)
         if ($ik.Key -eq 'Enter') {
             if ($buf.Trim()) {
@@ -202,34 +253,60 @@ function Send-Note($agentPane, $agent, $tasks) {
     }
 }
 
+# ---- main loop (skipped when dot-sourced for tests) ----
+if ($MyInvocation.InvocationName -eq '.') { return }
+$pal = Resolve-Palette (Read-Config)
+$ws = $env:HERDR_WORKSPACE_ID
 [Console]::Write("$esc[?25l$esc[2J")  # hide cursor, clear once
 try {
-    $lastRender = ''; $lastMtime = [datetime]::MinValue; $lastPath = ''; $tasks = @()
-    $agentPane = ''; $status = ''; $statusAt = [datetime]::MinValue
+    $lastRender = ''; $lastPoll = [datetime]::MinValue; $agent = ''; $agentPane = ''
+    $status = ''; $statusAt = [datetime]::MinValue
+    $scroll = 0; $follow = $true; $lastActive = -1
     while ($true) {
-        if ([Console]::KeyAvailable) {
+        $dirty = $false
+        while ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true)
-            if ($k.KeyChar -eq 'q') { break }
-            if (($k.Modifiers -band [ConsoleModifiers]::Control) -and $k.Key -eq 'C') { break }
-            if ($k.KeyChar -eq 's' -and $agentPane) {
-                $status = Send-Note $agentPane $agent $tasks
-                $statusAt = [datetime]::Now
-                $lastRender = ''  # force redraw out of input mode
+            $page = [Math]::Max(1, (Get-VisRows) - 1)
+            if ($k.KeyChar -eq 'q') { throw 'quit' }
+            elseif (($k.Modifiers -band [ConsoleModifiers]::Control) -and $k.Key -eq 'C') { throw 'quit' }
+            elseif ($k.KeyChar -eq 's' -and $agentPane) { $status = Send-Note $agentPane $agent $script:T_tasks $scroll; $statusAt = [datetime]::Now; $dirty = $true }
+            elseif ($k.KeyChar -eq 'j' -or $k.Key -eq 'DownArrow') { $scroll++; $follow = $false; $dirty = $true }
+            elseif ($k.KeyChar -eq 'k' -or $k.Key -eq 'UpArrow') { $scroll--; $follow = $false; $dirty = $true }
+            elseif ($k.Key -eq 'PageDown') { $scroll += $page; $follow = $false; $dirty = $true }
+            elseif ($k.Key -eq 'PageUp') { $scroll -= $page; $follow = $false; $dirty = $true }
+            elseif ($k.KeyChar -eq 'g' -or $k.Key -eq 'Home') { $follow = $true; $dirty = $true }
+        }
+
+        if (([datetime]::Now - $lastPoll).TotalMilliseconds -ge 900) {
+            $lastPoll = [datetime]::Now
+            $info = Get-TabAgent
+            $newAgent = if ($info) { $info.agent } else { '' }
+            $agentPane = if ($info) { $info.pane } else { '' }
+            if ($newAgent -ne $agent) { $agent = $newAgent; $dirty = $true }
+            $path = if ($info) { Find-Transcript $info.session } else { $null }
+            if ($path) { if (Update-Tasks $path) { $dirty = $true } }
+            elseif ($script:T_path) { $script:T_path = ''; Reset-Tasks; $dirty = $true }
+        }
+
+        if ($status -and ([datetime]::Now - $statusAt).TotalSeconds -gt 5) { $status = ''; $dirty = $true }
+
+        $total = $script:T_tasks.Count
+        # Auto-follow the active task (until the user scrolls); re-arm follow when it changes.
+        $active = Active-Index $script:T_tasks
+        if ($active -ne $lastActive) { $follow = $true; $lastActive = $active }
+        if ($follow) {
+            if ($active -ge 0) {
+                if ($active -lt $scroll) { $scroll = $active }
+                elseif ($active -ge $scroll + (Get-VisRows)) { $scroll = $active - (Get-VisRows) + 1 }
             }
+            else { $scroll = [Math]::Max(0, $total - (Get-VisRows)) }
         }
-        $agentInfo = Get-TabAgent
-        $agent = if ($agentInfo) { $agentInfo.agent } else { '' }
-        $agentPane = if ($agentInfo) { $agentInfo.pane } else { '' }
-        $path = if ($agentInfo) { Find-Transcript $agentInfo.session } else { $null }
-        if ($path -and (Test-Path $path)) {
-            $mtime = (Get-Item $path).LastWriteTimeUtc
-            if ($path -ne $lastPath -or $mtime -ne $lastMtime) { $tasks = Read-Tasks $path; $lastMtime = $mtime; $lastPath = $path }
-            $key = "$path|$mtime|$agent|$status"
-        }
-        else { $tasks = @(); $key = "none|$agent|$status" }
-        if ($status -and ([datetime]::Now - $statusAt).TotalSeconds -gt 5) { $status = ''; $lastRender = '' }
-        if ($key -ne $lastRender) { Render $tasks $agent $ws $pal $null $status; $lastRender = $key }
-        Start-Sleep -Milliseconds 1000
+        $scroll = Clamp-Scroll $scroll $total
+
+        $key = "$($script:T_path)|$($script:T_offset)|$agent|$status|$scroll|$total"
+        if ($dirty -or $key -ne $lastRender) { Render $script:T_tasks $agent $ws $pal $null $status $scroll; $lastRender = $key }
+        Start-Sleep -Milliseconds 60
     }
 }
+catch { }
 finally { [Console]::Write("$esc[?25h$esc[0m") }
