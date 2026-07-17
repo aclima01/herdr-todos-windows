@@ -66,6 +66,35 @@ type = "plugin_action"
 command = "aclima.herdr-todos-windows.toggle"
 ```
 
+## Configuration
+
+Drop a `config.toml` in the plugin's config dir
+(`%APPDATA%\herdr\plugins\config\aclima.herdr-todos-windows\config.toml`). It is read when the
+panel opens, so re-open it to apply changes.
+
+```toml
+# Colors: a named preset, or override individual colors below.
+theme = "midnight"          # default | midnight | mono | forest
+
+# Per-color overrides (hex "#rrggbb"); any of these wins over the preset:
+# bg      = "#11131a"       # pane background ("" = terminal default / transparent)
+# fg      = "#c8d3f5"       # normal text
+# title   = "#7dcfff"       # the "TO-DOs" header
+# done    = "#4b5263"       # completed rows
+# active  = "#e0af68"       # the in-progress row
+# pending = "#7aa2f7"       # not-started rows
+# rule    = "#2a2f3d"       # the divider line
+
+# Layout:
+placement = "split"         # split | popup | tab | zoomed
+direction = "right"         # split direction: right | down
+
+# Size: only honored for placement = "popup" (a floating window). A split's size is adjusted
+# interactively with < / > — herdr owns split proportions, so width/height are ignored there.
+# width  = 44
+# height = 20
+```
+
 ## Roadmap
 
 - **Steer the model (v2).** A note box in the panel that sends an adjustment back to the agent's

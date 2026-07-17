@@ -4,10 +4,14 @@
 # It resolves the agent sharing this pane's tab, finds that session's transcript
 # (~/.claude/projects/**/<session-id>.jsonl), replays TaskCreate (ids 1..N in order) + TaskUpdate
 # (taskId -> status) into the current list, and redraws when the transcript changes. Poll-based, so
-# it catches mid-turn task edits (status-change events would be too coarse). Press q to quit.
+# it catches mid-turn task edits. Press q to quit.
 #
-# Source is pure ASCII on purpose: Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, which
-# corrupts multi-byte literals, so glyphs are built from [char] codes at runtime instead.
+# Theming: reads $HERDR_PLUGIN_CONFIG_DIR/config.toml (a flat key = value file). `theme` picks a
+# preset; individual colors (`bg`, `fg`, `done`, `active`, `pending`, `accent`, hex "#rrggbb")
+# override it. A `bg` paints the whole pane. Size/placement live in panel.ps1 (the opener).
+#
+# Source is pure ASCII on purpose: PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so glyphs are
+# built from [char] codes rather than written as literals.
 
 $ErrorActionPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -15,29 +19,62 @@ $ErrorActionPreference = 'SilentlyContinue'
 $herdr = if ($env:HERDR_BIN_PATH) { $env:HERDR_BIN_PATH } else { 'herdr' }
 $esc = [char]27
 
-function Ansi([string]$code) { "$esc[$code" + "m" }
-$RESET = Ansi '0'; $DIM = Ansi '2'; $BOLD = Ansi '1'
-$GREEN = Ansi '32'; $YELLOW = Ansi '93'; $CYAN = Ansi '36'; $GREY = Ansi '90'
+# Glyphs (from code points so the source stays ASCII).
+$G_CHECK = [char]0x2713; $G_PLAY = [char]0x25B6; $G_CIRC = [char]0x25CB; $G_CROSS = [char]0x2717
+$MIDDOT = [char]0x00B7; $HR = [string][char]0x2500
 
-# Glyphs (built from code points so the source stays ASCII).
-$G_CHECK = [char]0x2713   # check
-$G_PLAY = [char]0x25B6    # in-progress
-$G_CIRC = [char]0x25CB    # pending
-$G_CROSS = [char]0x2717   # cancelled
-$MIDDOT = [char]0x00B7    # separator
-$HR = [string][char]0x2500
+# ---- config + theme ----
+$THEMES = @{
+    default  = @{ bg = ''; fg = '';        title = '#56b6c2'; done = '#6a737d'; active = '#e5c07b'; pending = '#61afef'; rule = '#3b4048' }
+    midnight = @{ bg = '#11131a'; fg = '#c8d3f5'; title = '#7dcfff'; done = '#4b5263'; active = '#e0af68'; pending = '#7aa2f7'; rule = '#2a2f3d' }
+    mono     = @{ bg = '#1c1c1c'; fg = '#d0d0d0'; title = '#bcbcbc'; done = '#585858'; active = '#ffffff'; pending = '#9e9e9e'; rule = '#3a3a3a' }
+    forest   = @{ bg = '#0f1a12'; fg = '#cfe8d4'; title = '#8fd694'; done = '#4a5a4d'; active = '#e6c07b'; pending = '#7fb069'; rule = '#243026' }
+}
 
-# The agent that shares this panel's tab (excluding this pane). Returns @{ session; agent } or $null.
+function Read-Config {
+    $cfg = @{}
+    $dir = $env:HERDR_PLUGIN_CONFIG_DIR
+    if (-not $dir) { return $cfg }
+    $file = Join-Path $dir 'config.toml'
+    if (-not (Test-Path $file)) { return $cfg }
+    foreach ($line in (Get-Content -LiteralPath $file)) {
+        $l = $line.Trim()
+        if (-not $l -or $l.StartsWith('#')) { continue }
+        if ($l -match '^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$') {
+            $k = $matches[1]
+            $v = $matches[2].Trim() -replace '\s+#.*$', ''
+            if ($v -match '^"(.*)"$' -or $v -match "^'(.*)'$") { $v = $matches[1] }
+            $cfg[$k] = $v
+        }
+    }
+    $cfg
+}
+
+function Resolve-Palette($cfg) {
+    $name = if ($cfg.theme) { $cfg.theme } else { 'default' }
+    $p = if ($THEMES.ContainsKey($name)) { $THEMES[$name].Clone() } else { $THEMES['default'].Clone() }
+    foreach ($k in 'bg', 'fg', 'title', 'done', 'active', 'pending', 'rule') {
+        if ($cfg[$k]) { $p[$k] = $cfg[$k] }
+    }
+    $p
+}
+
+function HexRGB([string]$hex) {
+    $h = $hex.TrimStart('#')
+    if ($h.Length -ne 6) { return $null }
+    [int]("0x" + $h.Substring(0, 2)), [int]("0x" + $h.Substring(2, 2)), [int]("0x" + $h.Substring(4, 2))
+}
+function Fg([string]$hex) { if (-not $hex) { return '' }; $c = HexRGB $hex; if (-not $c) { return '' }; "$esc[38;2;$($c[0]);$($c[1]);$($c[2])m" }
+function Bg([string]$hex) { if (-not $hex) { return '' }; $c = HexRGB $hex; if (-not $c) { return '' }; "$esc[48;2;$($c[0]);$($c[1]);$($c[2])m" }
+
+# ---- agent + transcript ----
 function Get-TabAgent {
     $ws = $env:HERDR_WORKSPACE_ID
     if (-not $ws) { return $null }
     $panes = (& $herdr pane list --workspace $ws 2>$null | ConvertFrom-Json).result.panes
     if (-not $panes) { return $null }
-    $me = $env:HERDR_PANE_ID
-    $tab = $env:HERDR_TAB_ID
-    $p = $panes |
-        Where-Object { $_.agent -and $_.pane_id -ne $me -and (-not $tab -or $_.tab_id -eq $tab) } |
-        Select-Object -First 1
+    $me = $env:HERDR_PANE_ID; $tab = $env:HERDR_TAB_ID
+    $p = $panes | Where-Object { $_.agent -and $_.pane_id -ne $me -and (-not $tab -or $_.tab_id -eq $tab) } | Select-Object -First 1
     if (-not $p) { return $null }
     @{ session = [string]$p.agent_session.value; agent = [string]$p.agent }
 }
@@ -46,12 +83,10 @@ function Find-Transcript([string]$sessionId) {
     if (-not $sessionId) { return $null }
     $root = Join-Path $env:USERPROFILE '.claude\projects'
     if (-not (Test-Path $root)) { return $null }
-    $f = Get-ChildItem -Path $root -Recurse -File -Filter "$sessionId.jsonl" -ErrorAction SilentlyContinue |
-        Select-Object -First 1
+    $f = Get-ChildItem -Path $root -Recurse -File -Filter "$sessionId.jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($f) { $f.FullName } else { $null }
 }
 
-# Replay the transcript's Task tool calls into the ordered task list.
 function Read-Tasks([string]$path) {
     $tasks = New-Object System.Collections.Generic.List[object]
     $byId = @{}
@@ -64,10 +99,7 @@ function Read-Tasks([string]$path) {
             if ($b.type -ne 'tool_use') { continue }
             if ($b.name -eq 'TaskCreate') {
                 $id = [string]($tasks.Count + 1)
-                $t = [pscustomobject]@{
-                    id = $id; subject = [string]$b.input.subject
-                    activeForm = [string]$b.input.activeForm; status = 'pending'
-                }
+                $t = [pscustomobject]@{ id = $id; subject = [string]$b.input.subject; activeForm = [string]$b.input.activeForm; status = 'pending' }
                 $tasks.Add($t); $byId[$id] = $t
             }
             elseif ($b.name -eq 'TaskUpdate') {
@@ -79,47 +111,61 @@ function Read-Tasks([string]$path) {
     $tasks
 }
 
-function Render([object]$tasks, [string]$agent, [string]$ws) {
-    $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.Append("$esc[2J$esc[H")  # clear + home
+# ---- render ----
+# Each row is @{ plain = '<text no ANSI>'; styled = '<text with color>' } so padding uses plain len.
+function Render($tasks, $agent, $ws, $pal) {
+    $bg = Bg $pal.bg
+    $fg = Fg $pal.fg
+    $reset = "$esc[0m"
+    $dim = "$esc[2m"
+    try { $W = [Console]::WindowWidth } catch { $W = 44 }
+    try { $H = [Console]::WindowHeight } catch { $H = 24 }
+    if ($W -lt 10) { $W = 44 }; if ($H -lt 4) { $H = 24 }
+
+    $rows = New-Object System.Collections.Generic.List[object]
     $done = @($tasks | Where-Object { $_.status -eq 'completed' }).Count
     $total = $tasks.Count
     $who = @($agent, $ws | Where-Object { $_ }) -join " $MIDDOT "
-    [void]$sb.AppendLine("$BOLD$CYAN TO-DOs$RESET $DIM$who$RESET")
-    [void]$sb.AppendLine("$GREY " + ($HR * 46) + $RESET)
+    $rows.Add(@{ plain = " TO-DOs $who"; styled = " $(Fg $pal.title)$esc[1mTO-DOs$reset$fg $dim$who$reset$fg" })
+    $rows.Add(@{ plain = ' ' + ($HR * ($W - 2)); styled = " $(Fg $pal.rule)$($HR * ($W - 2))$reset$fg" })
     if ($total -eq 0) {
-        [void]$sb.AppendLine("$DIM  (no tasks yet - the agent has not planned this turn)$RESET")
+        $rows.Add(@{ plain = '  (no tasks yet - the agent has not planned this turn)'; styled = "  $dim(no tasks yet - the agent has not planned this turn)$reset$fg" })
     }
     else {
         foreach ($t in $tasks) {
             switch ($t.status) {
-                'completed' { $glyph = "$GREEN$G_CHECK$RESET"; $text = "$DIM$($t.subject)$RESET" }
-                'in_progress' {
-                    $glyph = "$YELLOW$G_PLAY$RESET"
-                    $label = if ($t.activeForm) { $t.activeForm } else { $t.subject }
-                    $text = "$BOLD$YELLOW$label$RESET"
-                }
-                'cancelled' { $glyph = "$GREY$G_CROSS$RESET"; $text = "$GREY$($t.subject)$RESET" }
-                default { $glyph = "$GREY$G_CIRC$RESET"; $text = $t.subject }
+                'completed'   { $g = "$(Fg $pal.done)$G_CHECK$reset$fg"; $label = $t.subject; $s = "$dim$label$reset$fg" }
+                'in_progress' { $g = "$(Fg $pal.active)$G_PLAY$reset$fg"; $label = if ($t.activeForm) { $t.activeForm } else { $t.subject }; $s = "$(Fg $pal.active)$esc[1m$label$reset$fg" }
+                'cancelled'   { $g = "$(Fg $pal.done)$G_CROSS$reset$fg"; $label = $t.subject; $s = "$dim$label$reset$fg" }
+                default       { $g = "$(Fg $pal.pending)$G_CIRC$reset$fg"; $label = $t.subject; $s = "$(Fg $pal.pending)$label$reset$fg" }
             }
             $num = "{0,2}" -f $t.id
-            [void]$sb.AppendLine("  $glyph $GREY$num$RESET $text")
+            $rows.Add(@{ plain = "  X $num $label"; styled = "  $g $dim$num$reset$fg $s" })
         }
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine("$DIM  $done/$total done$RESET")
+        $rows.Add(@{ plain = ''; styled = '' })
+        $rows.Add(@{ plain = "  $done/$total done"; styled = "  $dim$done/$total done$reset$fg" })
     }
-    [void]$sb.Append("$GREY`n  q to close$RESET")
-    [Console]::Write($sb.ToString())
+    $rows.Add(@{ plain = ''; styled = '' })
+    $rows.Add(@{ plain = '  q to close'; styled = "  $dim q to close$reset$fg" })
+
+    $out = [System.Text.StringBuilder]::new()
+    [void]$out.Append("$bg$esc[2J$esc[H") # set bg, clear to it, home — no scroll artifacts
+    for ($i = 0; $i -lt $H; $i++) {
+        $plain = if ($i -lt $rows.Count) { [string]$rows[$i].plain } else { '' }
+        $styled = if ($i -lt $rows.Count) { [string]$rows[$i].styled } else { '' }
+        $pad = $W - $plain.Length; if ($pad -lt 0) { $pad = 0 }
+        [void]$out.Append("$bg$fg$styled" + (' ' * $pad) + $reset)
+        if ($i -lt $H - 1) { [void]$out.Append("`n") }
+    }
+    [Console]::Write($out.ToString())
 }
 
-# --- main loop (skipped when dot-sourced for tests) ---
+# ---- main loop (skipped when dot-sourced for tests) ----
 if ($MyInvocation.InvocationName -eq '.') { return }
-[Console]::Write("$esc[?25l")  # hide cursor
+$pal = Resolve-Palette (Read-Config)
+[Console]::Write("$esc[?25l$esc[2J")  # hide cursor, clear once
 try {
-    $lastRender = ''
-    $lastMtime = [datetime]::MinValue
-    $lastPath = ''
-    $tasks = @()
+    $lastRender = ''; $lastMtime = [datetime]::MinValue; $lastPath = ''; $tasks = @()
     while ($true) {
         if ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true)
@@ -129,27 +175,14 @@ try {
         $agentInfo = Get-TabAgent
         $agent = if ($agentInfo) { $agentInfo.agent } else { '' }
         $path = if ($agentInfo) { Find-Transcript $agentInfo.session } else { $null }
-
         if ($path -and (Test-Path $path)) {
             $mtime = (Get-Item $path).LastWriteTimeUtc
-            if ($path -ne $lastPath -or $mtime -ne $lastMtime) {
-                $tasks = Read-Tasks $path
-                $lastMtime = $mtime; $lastPath = $path
-            }
+            if ($path -ne $lastPath -or $mtime -ne $lastMtime) { $tasks = Read-Tasks $path; $lastMtime = $mtime; $lastPath = $path }
             $key = "$path|$mtime|$agent"
         }
-        else {
-            $tasks = @()
-            $key = "none|$agent"
-        }
-
-        if ($key -ne $lastRender) {
-            Render $tasks $agent $env:HERDR_WORKSPACE_ID
-            $lastRender = $key
-        }
+        else { $tasks = @(); $key = "none|$agent" }
+        if ($key -ne $lastRender) { Render $tasks $agent $env:HERDR_WORKSPACE_ID $pal; $lastRender = $key }
         Start-Sleep -Milliseconds 1000
     }
 }
-finally {
-    [Console]::Write("$esc[?25h$esc[0m")  # show cursor, reset
-}
+finally { [Console]::Write("$esc[?25h$esc[0m") }

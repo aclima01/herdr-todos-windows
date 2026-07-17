@@ -11,6 +11,32 @@ $pluginId = if ($env:HERDR_PLUGIN_ID) { $env:HERDR_PLUGIN_ID } else { 'aclima.he
 function Herdr { & $herdr @args 2>$null }
 function Fail([string]$msg) { [Console]::Error.WriteLine("todos: $msg"); exit 1 }
 
+# Layout config ($HERDR_PLUGIN_CONFIG_DIR/config.toml, flat key = value): placement, direction,
+# width, height. Colors live in todo-panel.ps1. Defaults: a 44-col right split.
+function Read-Config {
+    $cfg = @{}
+    $dir = $env:HERDR_PLUGIN_CONFIG_DIR
+    if ($dir) {
+        $file = Join-Path $dir 'config.toml'
+        if (Test-Path $file) {
+            foreach ($line in (Get-Content -LiteralPath $file)) {
+                $l = $line.Trim()
+                if (-not $l -or $l.StartsWith('#')) { continue }
+                if ($l -match '^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$') {
+                    $k = $matches[1]
+                    $v = $matches[2].Trim() -replace '\s+#.*$', ''
+                    if ($v -match '^"(.*)"$' -or $v -match "^'(.*)'$") { $v = $matches[1] }
+                    $cfg[$k] = $v
+                }
+            }
+        }
+    }
+    $cfg
+}
+$cfg = Read-Config
+$placement = if ($cfg.placement) { $cfg.placement } else { 'split' }
+$direction = if ($cfg.direction) { $cfg.direction } else { 'right' }
+
 $ws = $env:HERDR_WORKSPACE_ID
 $pane = $env:HERDR_PANE_ID
 if (-not $ws) { Fail 'no workspace context (invoke from inside herdr)' }
@@ -31,12 +57,24 @@ if ($Mode -eq 'close') { if ($existing.Count) { Close-All } else { "close: nothi
 if ($Mode -eq 'toggle' -and $existing.Count) { Close-All; exit 0 }
 if ($Mode -eq 'open' -and $existing.Count) { "open: already open in $ws"; exit 0 }
 
-# Open as a split beside the focused pane, else the workspace's first pane.
-if (-not $pane -and $panes) { $pane = $panes[0].pane_id }
-if (-not $pane) { Fail "no pane to attach to in $ws" }
+# Build placement args from config. herdr rules: split/zoomed attach to a target pane; tab targets
+# the workspace; popup/overlay target the active pane automatically. --width/--height are honored
+# ONLY for popup (a split's size is adjusted interactively with < / >, not set here).
+$openArgs = @('--placement', $placement)
+if ($placement -eq 'split' -or $placement -eq 'zoomed') {
+    if (-not $pane -and $panes) { $pane = $panes[0].pane_id }
+    if (-not $pane) { Fail "no pane to attach to in $ws" }
+    $openArgs += @('--target-pane', $pane)
+    if ($placement -eq 'split') { $openArgs += @('--direction', $direction) }
+}
+elseif ($placement -eq 'tab') { $openArgs += @('--workspace', $ws) }
+elseif ($placement -eq 'popup') {
+    if ($cfg.width) { $openArgs += @('--width', [string]$cfg.width) }
+    if ($cfg.height) { $openArgs += @('--height', [string]$cfg.height) }
+}
 
 $openJson = (Herdr plugin pane open --plugin $pluginId --entrypoint todos `
-        --placement split --direction right --target-pane $pane --no-focus | Out-String).Trim()
+        @openArgs --no-focus | Out-String).Trim()
 $new = ''
 if ($openJson) { try { $new = ($openJson | ConvertFrom-Json).result.plugin_pane.pane.pane_id } catch {} }
 if (-not $new) { Fail 'herdr plugin pane open failed' }
