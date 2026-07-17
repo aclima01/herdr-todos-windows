@@ -95,12 +95,17 @@ direction = "right"         # split direction: right | down
 # height = 20
 ```
 
+## Steer the model
+
+The panel is two-way, not just a mirror. Press **`s`**, type a note, and **Enter** to drop it into
+the agent's input via `herdr agent send` — e.g. *"do #3 before #2"* or *"add a task for the timeout
+case"* — then the agent pane takes focus so you review and hit enter. The note fills the input; it
+never submits on its own. `Esc` cancels.
+
 ## Roadmap
 
-- **Steer the model (v2).** A note box in the panel that sends an adjustment back to the agent's
-  input via `herdr agent send` ("do #3 before #2", "add a task for the timeout case"), so the panel
-  becomes a two-way guide, not just a mirror.
 - Incremental transcript tailing (a high-watermark) instead of a full replay each change.
+- Scroll when the list is taller than the pane.
 
 ## License
 

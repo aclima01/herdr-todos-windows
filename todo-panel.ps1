@@ -76,7 +76,7 @@ function Get-TabAgent {
     $me = $env:HERDR_PANE_ID; $tab = $env:HERDR_TAB_ID
     $p = $panes | Where-Object { $_.agent -and $_.pane_id -ne $me -and (-not $tab -or $_.tab_id -eq $tab) } | Select-Object -First 1
     if (-not $p) { return $null }
-    @{ session = [string]$p.agent_session.value; agent = [string]$p.agent }
+    @{ session = [string]$p.agent_session.value; agent = [string]$p.agent; pane = [string]$p.pane_id }
 }
 
 function Find-Transcript([string]$sessionId) {
@@ -113,7 +113,8 @@ function Read-Tasks([string]$path) {
 
 # ---- render ----
 # Each row is @{ plain = '<text no ANSI>'; styled = '<text with color>' } so padding uses plain len.
-function Render($tasks, $agent, $ws, $pal) {
+# $inputBuf: when not $null, the footer is a note-entry line. $status: a transient message.
+function Render($tasks, $agent, $ws, $pal, $inputBuf, $status) {
     $bg = Bg $pal.bg
     $fg = Fg $pal.fg
     # "reset" keeps the theme background: a bare \e[0m would clear the bg, leaving black gaps after
@@ -148,7 +149,18 @@ function Render($tasks, $agent, $ws, $pal) {
         $rows.Add(@{ plain = "  $done/$total done"; styled = "  $dim$done/$total done$reset$fg" })
     }
     $rows.Add(@{ plain = ''; styled = '' })
-    $rows.Add(@{ plain = '  q to close'; styled = "  $dim q to close$reset$fg" })
+    if ($null -ne $inputBuf) {
+        $cur = [char]0x2588
+        $rows.Add(@{ plain = "  note> $inputBuf"; styled = "  $(Fg $pal.active)note>$reset$fg $inputBuf$(Fg $pal.active)$cur$reset$fg" })
+        $rows.Add(@{ plain = '  Enter send to agent   Esc cancel'; styled = "  $dim Enter send to agent   Esc cancel$reset$fg" })
+    }
+    elseif ($status) {
+        $rows.Add(@{ plain = "  $status"; styled = "  $(Fg $pal.title)$status$reset$fg" })
+        $rows.Add(@{ plain = '  q close   s note to agent'; styled = "  $dim q close   s note to agent$reset$fg" })
+    }
+    else {
+        $rows.Add(@{ plain = '  q close   s note to agent'; styled = "  $dim q close   s note to agent$reset$fg" })
+    }
 
     $out = [System.Text.StringBuilder]::new()
     [void]$out.Append("$bg$esc[2J$esc[H") # set bg, clear to it, home
@@ -167,25 +179,56 @@ function Render($tasks, $agent, $ws, $pal) {
 # ---- main loop (skipped when dot-sourced for tests) ----
 if ($MyInvocation.InvocationName -eq '.') { return }
 $pal = Resolve-Palette (Read-Config)
+$ws = $env:HERDR_WORKSPACE_ID
+
+# Note-entry mode (v2 "steer"): type a note and send it to the agent's input via `herdr agent
+# send` (fills without submitting, then focuses the agent, like reviewr's Send). Returns a status.
+function Send-Note($agentPane, $agent, $tasks) {
+    $buf = ''
+    while ($true) {
+        Render $tasks $agent $ws $pal $buf ''
+        $ik = [Console]::ReadKey($true)
+        if ($ik.Key -eq 'Enter') {
+            if ($buf.Trim()) {
+                & $herdr agent send $agentPane $buf 2>$null | Out-Null
+                & $herdr agent focus $agentPane 2>$null | Out-Null
+                return "note sent to $agent"
+            }
+            return ''
+        }
+        if ($ik.Key -eq 'Escape') { return '' }
+        if ($ik.Key -eq 'Backspace') { if ($buf.Length) { $buf = $buf.Substring(0, $buf.Length - 1) }; continue }
+        if ($ik.KeyChar -and [int]$ik.KeyChar -ge 32) { $buf += $ik.KeyChar }
+    }
+}
+
 [Console]::Write("$esc[?25l$esc[2J")  # hide cursor, clear once
 try {
     $lastRender = ''; $lastMtime = [datetime]::MinValue; $lastPath = ''; $tasks = @()
+    $agentPane = ''; $status = ''; $statusAt = [datetime]::MinValue
     while ($true) {
         if ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true)
             if ($k.KeyChar -eq 'q') { break }
             if (($k.Modifiers -band [ConsoleModifiers]::Control) -and $k.Key -eq 'C') { break }
+            if ($k.KeyChar -eq 's' -and $agentPane) {
+                $status = Send-Note $agentPane $agent $tasks
+                $statusAt = [datetime]::Now
+                $lastRender = ''  # force redraw out of input mode
+            }
         }
         $agentInfo = Get-TabAgent
         $agent = if ($agentInfo) { $agentInfo.agent } else { '' }
+        $agentPane = if ($agentInfo) { $agentInfo.pane } else { '' }
         $path = if ($agentInfo) { Find-Transcript $agentInfo.session } else { $null }
         if ($path -and (Test-Path $path)) {
             $mtime = (Get-Item $path).LastWriteTimeUtc
             if ($path -ne $lastPath -or $mtime -ne $lastMtime) { $tasks = Read-Tasks $path; $lastMtime = $mtime; $lastPath = $path }
-            $key = "$path|$mtime|$agent"
+            $key = "$path|$mtime|$agent|$status"
         }
-        else { $tasks = @(); $key = "none|$agent" }
-        if ($key -ne $lastRender) { Render $tasks $agent $env:HERDR_WORKSPACE_ID $pal; $lastRender = $key }
+        else { $tasks = @(); $key = "none|$agent|$status" }
+        if ($status -and ([datetime]::Now - $statusAt).TotalSeconds -gt 5) { $status = ''; $lastRender = '' }
+        if ($key -ne $lastRender) { Render $tasks $agent $ws $pal $null $status; $lastRender = $key }
         Start-Sleep -Milliseconds 1000
     }
 }
