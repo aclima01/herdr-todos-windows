@@ -102,10 +102,23 @@ the agent's input via `herdr agent send` — e.g. *"do #3 before #2"* or *"add a
 case"* — then the agent pane takes focus so you review and hit enter. The note fills the input; it
 never submits on its own. `Esc` cancels.
 
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `s` | Send a note to the agent's input |
+| `j` / `k` · arrows | Scroll the list |
+| `PageUp` / `PageDown` | Scroll a page |
+| `g` / `Home` | Re-follow the active task |
+| `q` | Close the panel |
+
+The list auto-follows the in-progress task; once you scroll it stays put until the active task
+changes or you press `g`. When the list is taller than the pane it windows with a `x-y/N` position
+indicator. Transcript reads are incremental (a byte high-watermark), so a long session stays cheap.
+
 ## Roadmap
 
-- Incremental transcript tailing (a high-watermark) instead of a full replay each change.
-- Scroll when the list is taller than the pane.
+- Reflect task dependencies (blocks / blockedBy) and cancellations more richly.
 
 ## License
 
