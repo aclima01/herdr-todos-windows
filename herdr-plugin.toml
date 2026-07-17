@@ -1,0 +1,20 @@
+id = "aclima.herdr-todos-windows"
+name = "Agent TO-DOs for Windows"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+platforms = ["windows"]
+description = "A live panel of the focused agent's task list (TaskCreate/TaskUpdate) so you can follow its plan."
+
+# The panel pane renders the task list. It reads the agent's transcript, so it needs no cwd.
+[[panes]]
+id = "todos"
+title = "todos"
+placement = "split"
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "todo-panel.ps1"]
+
+# Open the panel as a right split beside the focused pane, or close it if already open.
+[[actions]]
+id = "toggle"
+title = "TO-DOs: toggle panel"
+contexts = ["pane", "workspace"]
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "panel.ps1", "toggle"]
