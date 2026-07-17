@@ -78,4 +78,25 @@ $openJson = (Herdr plugin pane open --plugin $pluginId --entrypoint todos `
 $new = ''
 if ($openJson) { try { $new = ($openJson | ConvertFrom-Json).result.plugin_pane.pane.pane_id } catch {} }
 if (-not $new) { Fail 'herdr plugin pane open failed' }
+
+# herdr's open takes no size for a split, so resize to the configured target afterward: `width`
+# (columns) for a right split, `height` (rows) for a down split. `pane resize --amount` is a
+# fraction of the split's total, and for the new (second) pane, left/up grows it, right/down shrinks.
+if ($placement -eq 'split') {
+    $target = if ($direction -eq 'down') { $cfg.height } else { $cfg.width }
+    if ($target) {
+        $lay = (Herdr pane layout --pane $new | ConvertFrom-Json).result.layout
+        $mine = $lay.panes | Where-Object { $_.pane_id -eq $new } | Select-Object -First 1
+        if ($mine) {
+            if ($direction -eq 'down') { $cur = [int]$mine.rect.height; $tot = [int]$lay.area.height; $grow = 'up'; $shrink = 'down' }
+            else { $cur = [int]$mine.rect.width; $tot = [int]$lay.area.width; $grow = 'left'; $shrink = 'right' }
+            $delta = [int]$target - $cur
+            if ($delta -ne 0 -and $tot -gt 0) {
+                $amount = [Math]::Round([Math]::Abs($delta) / $tot, 3)
+                $dir = if ($delta -gt 0) { $grow } else { $shrink }
+                Herdr pane resize --pane $new --direction $dir --amount ([string]$amount) | Out-Null
+            }
+        }
+    }
+}
 "opened $new in $ws"

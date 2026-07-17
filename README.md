@@ -89,9 +89,11 @@ theme = "midnight"          # default | midnight | mono | forest
 placement = "split"         # split | popup | tab | zoomed
 direction = "right"         # split direction: right | down
 
-# Size: only honored for placement = "popup" (a floating window). A split's size is adjusted
-# interactively with < / > — herdr owns split proportions, so width/height are ignored there.
-# width  = 44
+# Size:
+#   split  -> width = columns (right split) or height = rows (down split); the panel resizes
+#             itself to that target right after opening.
+#   popup  -> width / height are the floating window's dimensions.
+width  = 44
 # height = 20
 ```
 
