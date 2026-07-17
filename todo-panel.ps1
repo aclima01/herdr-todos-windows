@@ -116,7 +116,9 @@ function Read-Tasks([string]$path) {
 function Render($tasks, $agent, $ws, $pal) {
     $bg = Bg $pal.bg
     $fg = Fg $pal.fg
-    $reset = "$esc[0m"
+    # "reset" keeps the theme background: a bare \e[0m would clear the bg, leaving black gaps after
+    # every colored span. Re-applying $bg after the reset keeps the whole line on the theme color.
+    $reset = "$esc[0m$bg"
     $dim = "$esc[2m"
     try { $W = [Console]::WindowWidth } catch { $W = 44 }
     try { $H = [Console]::WindowHeight } catch { $H = 24 }
@@ -149,14 +151,16 @@ function Render($tasks, $agent, $ws, $pal) {
     $rows.Add(@{ plain = '  q to close'; styled = "  $dim q to close$reset$fg" })
 
     $out = [System.Text.StringBuilder]::new()
-    [void]$out.Append("$bg$esc[2J$esc[H") # set bg, clear to it, home — no scroll artifacts
-    for ($i = 0; $i -lt $H; $i++) {
-        $plain = if ($i -lt $rows.Count) { [string]$rows[$i].plain } else { '' }
-        $styled = if ($i -lt $rows.Count) { [string]$rows[$i].styled } else { '' }
+    [void]$out.Append("$bg$esc[2J$esc[H") # set bg, clear to it, home
+    $n = $rows.Count
+    for ($i = 0; $i -lt $n; $i++) {
+        $plain = [string]$rows[$i].plain
+        $styled = [string]$rows[$i].styled
         $pad = $W - $plain.Length; if ($pad -lt 0) { $pad = 0 }
         [void]$out.Append("$bg$fg$styled" + (' ' * $pad) + $reset)
-        if ($i -lt $H - 1) { [void]$out.Append("`n") }
+        if ($i -lt $n - 1) { [void]$out.Append("`n") }  # no trailing newline: never scroll
     }
+    [void]$out.Append("$bg$esc[0J$reset")  # paint the rest of the pane with the theme bg
     [Console]::Write($out.ToString())
 }
 
