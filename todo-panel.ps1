@@ -24,6 +24,7 @@ $esc = [char]27
 # Glyphs (from code points so the source stays ASCII).
 $G_CHECK = [char]0x2713; $G_PLAY = [char]0x25B6; $G_CIRC = [char]0x25CB; $G_CROSS = [char]0x2717
 $MIDDOT = [char]0x00B7; $HR = [string][char]0x2500; $G_UP = [char]0x2191; $G_DOWN = [char]0x2193
+$G_GEAR = [char]0x2699; $G_BLOCK = [char]0x26D4; $G_NOW = [char]0x203A  # working / blocked / activity
 
 # ---- config + theme ----
 $THEMES = @{
@@ -76,7 +77,8 @@ function Get-TabAgent {
     $me = $env:HERDR_PANE_ID; $tab = $env:HERDR_TAB_ID
     $p = $panes | Where-Object { $_.agent -and $_.pane_id -ne $me -and (-not $tab -or $_.tab_id -eq $tab) } | Select-Object -First 1
     if (-not $p) { return $null }
-    @{ session = [string]$p.agent_session.value; agent = [string]$p.agent; pane = [string]$p.pane_id }
+    @{ session = [string]$p.agent_session.value; agent = [string]$p.agent; pane = [string]$p.pane_id
+        status = [string]$p.agent_status; activity = [string]$p.terminal_title }
 }
 
 function Find-Transcript([string]$sessionId) {
@@ -93,6 +95,8 @@ $script:T_byId = @{}
 $script:T_offset = [long]0
 $script:T_path = ''
 $script:EmptyReason = @()   # why the list is empty (diagnostic), set by the poll loop
+$script:AgentStatus = ''    # working | idle | blocked (from pane list), set by the poll loop
+$script:AgentActivity = ''  # the agent's current terminal_title, set by the poll loop
 
 function Reset-Tasks {
     $script:T_tasks = New-Object System.Collections.Generic.List[object]
@@ -181,9 +185,36 @@ function Render($tasks, $agent, $ws, $pal, $inputBuf, $status, $scroll) {
     $rows = New-Object System.Collections.Generic.List[object]
     $done = @($tasks | Where-Object { $_.status -eq 'completed' }).Count
     $total = $tasks.Count
-    $who = @($agent, $ws | Where-Object { $_ }) -join " $MIDDOT "
-    $rows.Add(@{ plain = " TO-DOs $who"; styled = " $(Fg $pal.title)$esc[1mTO-DOs$reset$fg $dim$who$reset$fg" })
+    # Header: TO-DOs <agent> <status glyph> · <ws>
+    $red = "$esc[38;2;224;108;117m"
+    $sChar = ''; $sStyled = ''
+    switch ($script:AgentStatus) {
+        'working' { $sChar = [string]$G_GEAR; $sStyled = "$(Fg $pal.active)$G_GEAR$reset$fg" }
+        'blocked' { $sChar = [string]$G_BLOCK; $sStyled = "$red$esc[1m$G_BLOCK$reset$fg" }
+        'idle'    { $sChar = [string]$G_CHECK; $sStyled = "$(Fg $pal.done)$G_CHECK$reset$fg" }
+        default { }
+    }
+    $hp = ' TO-DOs'; $hs = " $(Fg $pal.title)$esc[1mTO-DOs$reset$fg"
+    if ($agent) {
+        $hp += " $agent"; $hs += " $dim$agent$reset$fg"
+        if ($sChar) { $hp += " $sChar"; $hs += " $sStyled" }
+    }
+    if ($ws) { $hp += " $MIDDOT $ws"; $hs += " $dim$MIDDOT $ws$reset$fg" }
+    $rows.Add(@{ plain = $hp; styled = $hs })
     $rows.Add(@{ plain = ' ' + ($HR * ($W - 2)); styled = " $(Fg $pal.rule)$($HR * ($W - 2))$reset$fg" })
+
+    # "Now" line: a blocked warning, or the agent's current activity (terminal_title) while working.
+    if ($script:AgentStatus -eq 'blocked') {
+        $rows.Add(@{ plain = "  $G_BLOCK blocked - waiting for your input"; styled = "  $red$esc[1m$G_BLOCK blocked - waiting for your input$reset$fg" })
+    }
+    elseif ($script:AgentStatus -eq 'working') {
+        $act = ($script:AgentActivity -replace '[\x00-\x1f\x7f]', ' ' -replace '^[^\p{L}\p{N}]+\s*', '').Trim()
+        if ($act) {
+            $max = $W - 6
+            if ($max -gt 1 -and $act.Length -gt $max) { $act = $act.Substring(0, $max) + [char]0x2026 }
+            $rows.Add(@{ plain = "  $G_NOW $act"; styled = "  $(Fg $pal.active)$G_NOW$reset$fg $dim$act$reset$fg" })
+        }
+    }
 
     if ($total -eq 0) {
         if ($script:EmptyReason -and $script:EmptyReason.Count) {
@@ -318,6 +349,12 @@ try {
             elseif (-not $info.session) { $reason = @("agent '$newAgent' has no session id", '(herdr version mismatch?)') }
             elseif (-not $path) { $reason = @("agent '$newAgent': no transcript found", 'under  ~\.claude\projects') }
             if (($reason -join '|') -ne ($script:EmptyReason -join '|')) { $script:EmptyReason = $reason; $dirty = $true }
+            # Live agent state for the "Now" line (free from pane list).
+            $newStatus = if ($info) { $info.status } else { '' }
+            $newActivity = if ($info) { $info.activity } else { '' }
+            if ($newStatus -ne $script:AgentStatus -or $newActivity -ne $script:AgentActivity) {
+                $script:AgentStatus = $newStatus; $script:AgentActivity = $newActivity; $dirty = $true
+            }
         }
 
         if ($status -and ([datetime]::Now - $statusAt).TotalSeconds -gt 5) { $status = ''; $dirty = $true }

@@ -3,9 +3,14 @@
 A live panel that mirrors the focused agent's **task list** into a herdr split pane, so you can
 follow the model's plan as it works — which steps are done, which one it's on, and what's left.
 
+The header also shows the agent's **live status** (a colored glyph: `working` / `idle` / `blocked`,
+with a red highlight when it's **blocked** and waiting on you), and a "Now" line with what it is
+currently working on (from the agent's terminal title). All of it comes free from `herdr pane list`.
+
 ```
- TO-DOs  claude · my-project
+ TO-DOs  claude  working · my-project
  ----------------------------------------------
+  >  Wiring the database ping check          (Now: current activity)
   v  1  Confirm the TO-DO data source
   v  2  Build the live renderer
   v  3  Wire the manifest + toggle
