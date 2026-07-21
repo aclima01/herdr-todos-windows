@@ -92,6 +92,7 @@ $script:T_tasks = New-Object System.Collections.Generic.List[object]
 $script:T_byId = @{}
 $script:T_offset = [long]0
 $script:T_path = ''
+$script:EmptyReason = @()   # why the list is empty (diagnostic), set by the poll loop
 
 function Reset-Tasks {
     $script:T_tasks = New-Object System.Collections.Generic.List[object]
@@ -166,7 +167,12 @@ function Render($tasks, $agent, $ws, $pal, $inputBuf, $status, $scroll) {
     $rows.Add(@{ plain = ' ' + ($HR * ($W - 2)); styled = " $(Fg $pal.rule)$($HR * ($W - 2))$reset$fg" })
 
     if ($total -eq 0) {
-        $rows.Add(@{ plain = '  (no tasks yet - the agent has not planned this turn)'; styled = "  $dim(no tasks yet - the agent has not planned this turn)$reset$fg" })
+        if ($script:EmptyReason -and $script:EmptyReason.Count) {
+            foreach ($ln in $script:EmptyReason) { $rows.Add(@{ plain = "  $ln"; styled = "  $dim$ln$reset$fg" }) }
+        }
+        else {
+            $rows.Add(@{ plain = '  (no tasks yet - the agent has not planned this turn)'; styled = "  $dim(no tasks yet - the agent has not planned this turn)$reset$fg" })
+        }
     }
     else {
         $from = $scroll
@@ -286,6 +292,13 @@ try {
             $path = if ($info) { Find-Transcript $info.session } else { $null }
             if ($path) { if (Update-Tasks $path) { $dirty = $true } }
             elseif ($script:T_path) { $script:T_path = ''; Reset-Tasks; $dirty = $true }
+            # Diagnose an empty list so a fresh machine self-reports where the chain breaks.
+            $reason = @()
+            if (-not $env:HERDR_WORKSPACE_ID) { $reason = @('no herdr workspace context') }
+            elseif (-not $info) { $reason = @('no Claude agent in this tab.', 'run:  herdr integration install claude') }
+            elseif (-not $info.session) { $reason = @("agent '$newAgent' has no session id", '(herdr version mismatch?)') }
+            elseif (-not $path) { $reason = @("agent '$newAgent': no transcript found", 'under  ~\.claude\projects') }
+            if (($reason -join '|') -ne ($script:EmptyReason -join '|')) { $script:EmptyReason = $reason; $dirty = $true }
         }
 
         if ($status -and ([datetime]::Now - $statusAt).TotalSeconds -gt 5) { $status = ''; $dirty = $true }
