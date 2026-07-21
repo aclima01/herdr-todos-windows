@@ -94,6 +94,10 @@ theme = "midnight"          # default | midnight | mono | forest
 placement = "split"         # split | popup | tab | zoomed
 direction = "right"         # split direction: right | down
 
+# Auto-open the panel when a worktree is created or an agent is detected (split/tab only).
+# It never stacks a second panel. Set false to only open it yourself with the toggle.
+auto_open = true
+
 # Size:
 #   split  -> width = columns (right split) or height = rows (down split); the panel resizes
 #             itself to that target right after opening.

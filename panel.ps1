@@ -57,6 +57,14 @@ if ($Mode -eq 'close') { if ($existing.Count) { Close-All } else { "close: nothi
 if ($Mode -eq 'toggle' -and $existing.Count) { Close-All; exit 0 }
 if ($Mode -eq 'open' -and $existing.Count) { "open: already open in $ws"; exit 0 }
 
+# Event auto-open (worktree.created / pane.agent_detected): gated by `auto_open` (default on), only
+# for split/tab placement, and idempotent — never opens a second panel. Then falls through to open.
+if ($Mode -eq 'event') {
+    if ("$($cfg.auto_open)" -match '^(?i:false|0|no|off)$') { "event: auto_open off"; exit 0 }
+    if ($placement -ne 'split' -and $placement -ne 'tab') { "event: $placement not auto-opened"; exit 0 }
+    if ($existing.Count) { "event: already open in $ws"; exit 0 }
+}
+
 # Build placement args from config. herdr rules: split/zoomed attach to a target pane; tab targets
 # the workspace; popup/overlay target the active pane automatically. --width/--height are honored
 # ONLY for popup (a split's size is adjusted interactively with < / >, not set here).

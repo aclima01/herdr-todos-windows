@@ -18,3 +18,13 @@ id = "toggle"
 title = "TO-DOs: toggle panel"
 contexts = ["pane", "workspace"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "panel.ps1", "toggle"]
+
+# Auto-open the panel when a worktree is created or an agent is detected. Gated by `auto_open`
+# (default on) in config.toml; only split/tab placement; idempotent (never stacks a second panel).
+[[events]]
+on = "worktree.created"
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "panel.ps1", "event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "panel.ps1", "event"]
