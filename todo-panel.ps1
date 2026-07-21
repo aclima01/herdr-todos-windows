@@ -101,7 +101,9 @@ function Reset-Tasks {
 }
 
 function Apply-Line([string]$line) {
-    if ($line.IndexOf('TaskCreate') -lt 0 -and $line.IndexOf('TaskUpdate') -lt 0) { return }
+    # Two schemes exist across Claude Code versions: the newer TaskCreate/TaskUpdate (incremental),
+    # and the older TodoWrite (one tool call rewrites the whole list). Support both.
+    if ($line.IndexOf('TaskCreate') -lt 0 -and $line.IndexOf('TaskUpdate') -lt 0 -and $line.IndexOf('TodoWrite') -lt 0) { return }
     $obj = $null; try { $obj = $line | ConvertFrom-Json } catch { return }
     $content = $obj.message.content
     if ($content -isnot [System.Array]) { return }
@@ -115,6 +117,23 @@ function Apply-Line([string]$line) {
         elseif ($b.name -eq 'TaskUpdate') {
             $id = [string]$b.input.taskId
             if ($script:T_byId.ContainsKey($id) -and $b.input.status) { $script:T_byId[$id].status = [string]$b.input.status }
+        }
+        elseif ($b.name -eq 'TodoWrite') {
+            # Whole-list rewrite. Replace the task list (keep the byte offset — only the list resets).
+            $list = New-Object System.Collections.Generic.List[object]
+            $map = @{}
+            if ($b.input.todos -is [System.Array]) {
+                $i = 0
+                foreach ($td in $b.input.todos) {
+                    $i++
+                    $subj = if ($td.content) { [string]$td.content } else { [string]$td.subject }
+                    $af = if ($td.activeForm) { [string]$td.activeForm } else { '' }
+                    $st = if ($td.status) { [string]$td.status } else { 'pending' }
+                    $t = [pscustomobject]@{ id = [string]$i; subject = $subj; activeForm = $af; status = $st }
+                    $list.Add($t); $map[$t.id] = $t
+                }
+            }
+            $script:T_tasks = $list; $script:T_byId = $map
         }
     }
 }
