@@ -336,7 +336,9 @@ function Send-Note($agentPane, $agent, $tasks, $scroll) {
         $ik = [Console]::ReadKey($true)
         if ($ik.Key -eq 'Enter') {
             if ($buf.Trim()) {
-                & $herdr agent send $agentPane $buf 2>$null | Out-Null
+                # herdr 0.7.5 replaced `agent send` with `agent send-keys`; try new, fall back to old.
+                & $herdr agent send-keys $agentPane $buf 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) { & $herdr agent send $agentPane $buf 2>$null | Out-Null }
                 & $herdr agent focus $agentPane 2>$null | Out-Null
                 return "note sent to $agent"
             }
