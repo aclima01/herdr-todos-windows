@@ -97,18 +97,31 @@ $script:T_path = ''
 $script:EmptyReason = @()   # why the list is empty (diagnostic), set by the poll loop
 $script:AgentStatus = ''    # working | idle | blocked (from pane list), set by the poll loop
 $script:AgentActivity = ''  # the agent's current terminal_title, set by the poll loop
+$script:PlanPath = ''       # latest plan file (~/.claude/plans/*.md) named by the transcript
+$script:PlanMtime = [datetime]::MinValue
+$script:PlanTasks = @()     # parsed plan steps, shown only while there are no real tasks
+$script:FromPlan = $false
 
 function Reset-Tasks {
     $script:T_tasks = New-Object System.Collections.Generic.List[object]
     $script:T_byId = @{}
     $script:T_offset = [long]0
+    $script:PlanPath = ''; $script:PlanTasks = @(); $script:PlanMtime = [datetime]::MinValue
 }
 
 function Apply-Line([string]$line) {
     # Two schemes exist across Claude Code versions: the newer TaskCreate/TaskUpdate (incremental),
-    # and the older TodoWrite (one tool call rewrites the whole list). Support both.
-    if ($line.IndexOf('TaskCreate') -lt 0 -and $line.IndexOf('TaskUpdate') -lt 0 -and $line.IndexOf('TodoWrite') -lt 0) { return }
+    # and the older TodoWrite (one tool call rewrites the whole list). Support both. Plan-mode
+    # attachments name the plan file (~/.claude/plans/*.md); track the latest as a fallback source.
+    $hasTask = ($line.IndexOf('TaskCreate') -ge 0 -or $line.IndexOf('TaskUpdate') -ge 0 -or $line.IndexOf('TodoWrite') -ge 0)
+    $hasPlan = ($line.IndexOf('planFilePath') -ge 0)
+    if (-not $hasTask -and -not $hasPlan) { return }
     $obj = $null; try { $obj = $line | ConvertFrom-Json } catch { return }
+    if ($hasPlan -and $obj.attachment -and $obj.attachment.planFilePath) {
+        $script:PlanPath = [string]$obj.attachment.planFilePath
+        $script:PlanMtime = [datetime]::MinValue   # force a re-read on the next poll
+    }
+    if (-not $hasTask) { return }
     $content = $obj.message.content
     if ($content -isnot [System.Array]) { return }
     foreach ($b in $content) {
@@ -140,6 +153,30 @@ function Apply-Line([string]$line) {
             $script:T_tasks = $list; $script:T_byId = $map
         }
     }
+}
+
+# Parse an approved plan's markdown into task-shaped steps. Checkbox items carry status
+# (- [ ] pending, - [x] done) and win when present; otherwise numbered items count, all pending.
+function Read-PlanTasks([string]$path) {
+    $boxes = New-Object System.Collections.Generic.List[object]
+    $nums = New-Object System.Collections.Generic.List[object]
+    foreach ($line in (Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*[-*]\s*\[([ xX])\]\s+(.+)$') {
+            $mark = $matches[1]; $body = $matches[2]        # capture before any further -match
+            $st = if ($mark -eq 'x') { 'completed' } else { 'pending' }   # -eq is case-insensitive
+            $boxes.Add(@{ s = $body; st = $st })
+        }
+        elseif ($line -match '^\s*\d+[\.\)]\s+(.+)$') { $nums.Add(@{ s = $matches[1]; st = 'pending' }) }
+    }
+    $src = if ($boxes.Count) { $boxes } else { $nums }
+    $out = @(); $i = 0
+    foreach ($e in $src) {
+        $i++
+        $subj = ([string]$e.s -replace '\*\*([^*]+)\*\*', '$1' -replace '`([^`]+)`', '$1').Trim()
+        if ($subj.Length -gt 120) { $subj = $subj.Substring(0, 120) }
+        $out += [pscustomobject]@{ id = [string]$i; subject = $subj; activeForm = ''; status = [string]$e.st }
+    }
+    $out
 }
 
 # Parse only the bytes appended since the last call. Returns $true when new complete lines applied.
@@ -246,7 +283,9 @@ function Render($tasks, $agent, $ws, $pal, $inputBuf, $status, $scroll) {
             $posP = "   $up$dn $($from + 1)-$to/$total"
             $pos = "   $(Fg $pal.pending)$up$dn$reset$fg $dim$($from + 1)-$to/$total$reset$fg"
         }
-        $rows.Add(@{ plain = "  $done/$total done$posP"; styled = "  $dim$done/$total done$reset$fg$pos" })
+        $planP = ''; $plan = ''
+        if ($script:FromPlan) { $planP = " $MIDDOT plan"; $plan = " $dim$MIDDOT$reset$fg $(Fg $pal.title)plan$reset$fg" }
+        $rows.Add(@{ plain = "  $done/$total done$planP$posP"; styled = "  $dim$done/$total done$reset$fg$plan$pos" })
     }
 
     $rows.Add(@{ plain = ''; styled = '' })
@@ -317,7 +356,7 @@ $ws = $env:HERDR_WORKSPACE_ID
 try {
     $lastRender = ''; $lastPoll = [datetime]::MinValue; $agent = ''; $agentPane = ''
     $status = ''; $statusAt = [datetime]::MinValue
-    $scroll = 0; $follow = $true; $lastActive = -1
+    $scroll = 0; $follow = $true; $lastActive = -1; $view = $script:T_tasks
     while ($true) {
         $dirty = $false
         while ([Console]::KeyAvailable) {
@@ -325,7 +364,7 @@ try {
             $page = [Math]::Max(1, (Get-VisRows) - 1)
             if ($k.KeyChar -eq 'q') { throw 'quit' }
             elseif (($k.Modifiers -band [ConsoleModifiers]::Control) -and $k.Key -eq 'C') { throw 'quit' }
-            elseif ($k.KeyChar -eq 's' -and $agentPane) { $status = Send-Note $agentPane $agent $script:T_tasks $scroll; $statusAt = [datetime]::Now; $dirty = $true }
+            elseif ($k.KeyChar -eq 's' -and $agentPane) { $status = Send-Note $agentPane $agent $view $scroll; $statusAt = [datetime]::Now; $dirty = $true }
             elseif ($k.KeyChar -eq 'j' -or $k.Key -eq 'DownArrow') { $scroll++; $follow = $false; $dirty = $true }
             elseif ($k.KeyChar -eq 'k' -or $k.Key -eq 'UpArrow') { $scroll--; $follow = $false; $dirty = $true }
             elseif ($k.Key -eq 'PageDown') { $scroll += $page; $follow = $false; $dirty = $true }
@@ -355,13 +394,21 @@ try {
             if ($newStatus -ne $script:AgentStatus -or $newActivity -ne $script:AgentActivity) {
                 $script:AgentStatus = $newStatus; $script:AgentActivity = $newActivity; $dirty = $true
             }
+            # Track the latest plan file; re-parse when it changes (steps can get checked off live).
+            if ($script:PlanPath -and (Test-Path $script:PlanPath)) {
+                $pmt = (Get-Item $script:PlanPath).LastWriteTimeUtc
+                if ($pmt -ne $script:PlanMtime) { $script:PlanTasks = @(Read-PlanTasks $script:PlanPath); $script:PlanMtime = $pmt; $dirty = $true }
+            }
         }
 
         if ($status -and ([datetime]::Now - $statusAt).TotalSeconds -gt 5) { $status = ''; $dirty = $true }
 
-        $total = $script:T_tasks.Count
+        # Real tasks win; with none, mirror the approved plan's steps (live from its file).
+        $script:FromPlan = ($script:T_tasks.Count -eq 0 -and $script:PlanTasks.Count -gt 0)
+        $view = if ($script:FromPlan) { $script:PlanTasks } else { $script:T_tasks }
+        $total = $view.Count
         # Auto-follow the active task (until the user scrolls); re-arm follow when it changes.
-        $active = Active-Index $script:T_tasks
+        $active = Active-Index $view
         if ($active -ne $lastActive) { $follow = $true; $lastActive = $active }
         if ($follow) {
             if ($active -ge 0) {
@@ -372,8 +419,8 @@ try {
         }
         $scroll = Clamp-Scroll $scroll $total
 
-        $key = "$($script:T_path)|$($script:T_offset)|$agent|$status|$scroll|$total"
-        if ($dirty -or $key -ne $lastRender) { Render $script:T_tasks $agent $ws $pal $null $status $scroll; $lastRender = $key }
+        $key = "$($script:T_path)|$($script:T_offset)|$agent|$status|$scroll|$total|$($script:FromPlan)|$($script:PlanMtime.Ticks)"
+        if ($dirty -or $key -ne $lastRender) { Render $view $agent $ws $pal $null $status $scroll; $lastRender = $key }
         Start-Sleep -Milliseconds 60
     }
 }

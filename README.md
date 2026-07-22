@@ -35,6 +35,12 @@ Claude Code records its plan as `TaskCreate` / `TaskUpdate` tool calls in the se
 An `in_progress` task shows its `activeForm` (the present-continuous label), like the Claude Code
 spinner. Press `q` to close. Pure PowerShell, no dependencies.
 
+**Plan fallback.** When the agent has no task list yet but the session has an approved plan
+(plan-mode writes it to `~/.claude/plans/*.md`, and the transcript names the file), the panel
+mirrors the plan's steps instead, tagged `plan` in the footer: checkbox items (`- [ ]` / `- [x]`)
+carry their status and update live as the file changes; otherwise numbered steps show as pending.
+The moment real tasks appear they take over.
+
 ## Requirements
 
 - Herdr `0.7.0` or newer, on **Windows** (herdr's Windows preview).
