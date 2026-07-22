@@ -81,12 +81,22 @@ function Get-TabAgent {
         status = [string]$p.agent_status; activity = [string]$p.terminal_title }
 }
 
+# The recursive scan costs tens of ms and grows with session history, so resolve each session id
+# once and reuse it; a 5s negative cache avoids re-walking every poll while a session has no file yet.
+$script:TrPathCache = @{}
+$script:TrMissAt = @{}
 function Find-Transcript([string]$sessionId) {
     if (-not $sessionId) { return $null }
+    $c = $script:TrPathCache[$sessionId]
+    if ($c -and (Test-Path $c)) { return $c }
+    $miss = $script:TrMissAt[$sessionId]
+    if ($miss -and ([datetime]::Now - $miss).TotalSeconds -lt 5) { return $null }
     $root = Join-Path $env:USERPROFILE '.claude\projects'
     if (-not (Test-Path $root)) { return $null }
     $f = Get-ChildItem -Path $root -Recurse -File -Filter "$sessionId.jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($f) { $f.FullName } else { $null }
+    if ($f) { $script:TrPathCache[$sessionId] = $f.FullName; return $f.FullName }
+    $script:TrMissAt[$sessionId] = [datetime]::Now
+    $null
 }
 
 # ---- incremental task reader (byte high-watermark) ----
